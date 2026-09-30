@@ -1,0 +1,289 @@
+# WikiBench
+
+**Русский бенчмарк для оценки аналитических способностей больших языковых моделей посредством генерации статей в стиле Википедии**
+
+---
+
+## Содержание
+
+1. [Описание](#описание)
+2. [Кратко об этапах оценки](#кратко-об-этапах-оценки)
+3. [Структура репозитория](#структура-репозитория)
+4. [Установка](#установка)
+5. [Подготовка окружения](#подготовка-окружения)
+6. [Пример использования](#пример-использования)
+
+---
+
+## Описание
+
+WikiBench — это бенчмарк, предоставляющий метод оценки, состоящий из трех этапов, который проверяет, насколько хорошо языковая модель умеет:
+
+1. **Находить и ранжировать релевантные источники** для статьи "Рувики";
+2. **Формировать связный план статьи** на базе предоставленных источников;
+3. **Писать качественный текст секций**, опираясь исключительно на информацию из соответствующих источников.
+
+---
+
+## Кратко об этапах оценки
+
+### Этап 1: Ранжирование
+
+BM25 выдает смесь релевантных и нерелевантынх сниппетов и модель помечает каждый как "да/нет". Оценка строится по лог‑вероятностям ответов, оценивая как правильность, так и уверенность в ответе.
+
+### Этап 2: План
+
+Сниппеты преобразуются в эмбеддинги и кластеризуются. Модель получает либо тексты кластеров, либо их краткие описания и формирует иерархический план статьи.
+
+### Этап 3: Секции
+
+Для каждой секции берутся свои сниппеты, группируются по косинусному сходству (>0.8), после чего модель итеративно разворачивает краткие описания групп в полноценный текст секции.
+
+---
+
+## Структура репозитория
+
+```text
+.
+├── Articles/                     # Данные для оценки
+│   ├── Sources/                  # Тексты источников, сгруппированные по статьям
+│   └── Downloaded_Sources_List/  # Сохраненные скачанные ссылки источников (в виде id из исходной статьи)
+│   └── Html/                     # Сохраненные HTML-коды статей
+├── Utils/                        # Закешированные обработанные данные
+│   ├── bm25_index/               # Проиндексированный в BM25 корпус
+│   ├── embeddings/               # Эмбеддинги текстов сниппетов
+│   ├── text_corpus/              # Набор сниппетов
+├── src/                          # Исходный код бенчмарка
+│   ├── openai_utils.py           # LLMCompleter для обращения к LLM + AsyncList
+│   ├── wiki_parse.py             # WikiParse — парсер HTML Википедии
+│   ├── wiki_extract.py           # WikiExtracter — скачивание источников
+│   ├── wiki_gen.py               # WikiGen — все промпты для генерации и обработка запросов
+│   ├── wiki_utils.py             # WikiUtils — сниппеты, эмбеддинги, BM25 и др.
+│   ├── wiki_agent.py             # WikiAgent — агент для прогона задач бенчмарка
+│   ├── wiki_evaluater.py         # WikiEval — оценка выдачи ответа модели
+│   └── wiki_bench.py             # WikiBench — основной модуль, объединяющий все вышеперечисленные
+├── main.ipynb                    # Демонстрация работы бенчмарка
+├── local_benchmark_vllm.ipynb    # Ноутбук для локального запуска через VLLM
+├── ruwikibench_articles.json     # Данные бенчмарка в json файле
+├── manage_dataset_structure.py   # Скрипт для преобразования json в обычную файловую систему
+└── requirements.txt              # Необходимые модули и библиотеки
+```
+
+---
+
+## Установка
+
+```bash
+# 1. Клонируем репозиторий
+$ git clone https://github.com/Nejimaki-Tori/WikiBench.git
+$ cd WikiBench
+
+# 2. Устанавливаем зависимости
+$ pip install -r requirements.txt
+
+# 3. Желательно установить torch с поддержкой вычислений на GPU
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+---
+
+## Подготовка окружения
+
+Для того, чтобы воспользоваться бенчмарком, необходимо подготовить окружение. Для этого достаточно скачать файл ruwikibench_articles.json (https://huggingface.co/datasets/NejimakiTori/RuWikiBench) и запустить представленный ниже код.
+Тогда json файл будет распакован в рабочие директории для бенчмарка.
+
+Скрипт WikiBench.prepare_env() создаст проиндексированный в bm25 корпус, а также словарь сниппетов и заранее посчитанные эмбеддинги.
+- are_texts_ready - используется для скачивания html кода статей напрямую с Рувики. По умолчанию установлен на True, не нужно менять, если нет острой необходимости скачать все статьи заново.
+- window_size - размер сниппетов (по умолчанию - 600)
+- overlap - перекрытие сниппетов (по умолчанию - 0)
+
+```python
+# ДАННЫЙ КОД НУЖЕН ДЛЯ ПОДГОТОВКИ ОКРУЖЕНИЯ В ПЕРВЫЙ РАЗ
+import nltk
+nltk.download('stopwords')
+
+import sys
+import torch
+from manage_dataset_structure import decompose_json
+sys.path.append('src')
+from wiki_bench import WikiBench
+from sentence_transformers import SentenceTransformer
+
+decompose_json() # json -> файлы
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+encoder = SentenceTransformer('sergeyzh/BERTA').to(device)
+
+bench = WikiBench(
+    key='',
+    url='',
+    model_name='',
+    model_safe_name='',
+    device=device,
+    encoder=encoder
+)
+
+bench.prepare_env()
+```
+
+## Запуск из командной строки
+
+После того как окружение подготовлено (`decompose_json()` и `WikiBench.prepare_env()` уже были выполнены хотя бы один раз), бенчмарк можно запускать через отдельный CLI-скрипт.
+
+### Базовый запуск
+
+```bash
+python run_bench.py \
+  --api https://your-api-endpoint/v1 \
+  --key YOUR_API_KEY \
+  --model-name your-model-name \
+  --concurrency 8 \
+  --output-dir ./runs
+```
+
+### Что делает скрипт
+
+1. Инициализирует `WikiBench` с указанными параметрами;
+2. Загружает заранее подготовленное окружение через `load_enviroment()`;
+3. Последовательно запускает:
+   * ранжирование источников;
+   * генерацию плана;
+   * генерацию секций;
+4. Сохраняет логи, сырые результаты и итоговые метрики в директорию `output_dir/model_name/`.
+
+Пример итоговой структуры:
+
+```text
+runs/
+└── your-model-name/
+    ├── run.log
+    ├── config.json
+    ├── benchmark_results.jsonl
+    ├── metrics.json
+    ├── metrics.csv
+    └── errors.jsonl
+```
+
+### Описание флагов
+- `--model-name`: Имя модели, которая будет использоваться для прогона бенчмарка. Это значение также используется как имя подпапки в `output_dir`.
+- `--concurrency`: Максимальное число одновременных запросов к модели.
+- `--output-dir`: Корневая директория для сохранения результатов запуска.
+- `--number-of-articles`: Количество статей, которое будет использоваться для оценки.
+- `--stage`: Этап бенчмарка для запуска. Возможные значения: `all` (по умолчанию), `ranking`, `outline`, `sections`. Позволяет запускать этапы независимо друг от друга.
+  - `all` — запустить все три этапа последовательно (эквивалентно поведению без флага);
+  - `ranking` — только ранжирование источников (`rank_query`);
+  - `outline` — только генерация плана статьи (`rank_outline`);
+  - `sections` — только генерация текста секций (`rank_sections`).
+
+### Примеры запуска отдельных этапов
+
+```bash
+# Только ранжирование источников
+python run_bench.py \
+  --api https://your-api-endpoint/v1 \
+  --key YOUR_API_KEY \
+  --model-name your-model-name \
+  --stage ranking \
+  --concurrency 8 \
+  --output-dir ./runs
+
+# Только генерация плана
+python run_bench.py \
+  --api https://your-api-endpoint/v1 \
+  --key YOUR_API_KEY \
+  --model-name your-model-name \
+  --stage outline \
+  --concurrency 8 \
+  --output-dir ./runs
+
+# Только генерация секций
+python run_bench.py \
+  --api https://your-api-endpoint/v1 \
+  --key YOUR_API_KEY \
+  --model-name your-model-name \
+  --stage sections \
+  --concurrency 8 \
+  --output-dir ./runs
+
+# Все этапы (явно)
+python run_bench.py \
+  --api https://your-api-endpoint/v1 \
+  --key YOUR_API_KEY \
+  --model-name your-model-name \
+  --stage all \
+  --concurrency 8 \
+  --output-dir ./runs
+```
+
+---
+
+### Пример запуска для нескольких моделей
+
+```bash
+python run_bench.py \
+  --api https://your-api-endpoint/v1 \
+  --key YOUR_API_KEY \
+  --model-name model-a \
+  --concurrency 40 \
+  --output-dir ./runs
+
+python run_bench.py \
+  --api https://your-api-endpoint/v1 \
+  --key YOUR_API_KEY \
+  --model-name model-b \
+  --concurrency 40 \
+  --output-dir ./runs
+```
+
+В результате будут созданы две отдельные директории:
+
+```text
+runs/
+├── model-a/
+└── model-b/
+```
+
+### Примечания
+
+* Перед первым запуском необходимо один раз подготовить окружение и кеши с помощью `prepare_env()`.
+* Если окружение уже подготовлено, повторно вызывать `prepare_env()` не нужно.
+* При повторном запуске одной и той же модели в ту же директорию рекомендуется либо очищать папку заранее, либо использовать другой `output_dir`.
+
+---
+
+
+## Пример использования в Jupyter Notebook
+
+```python
+import logging
+import torch
+from sentence_transformers import SentenceTransformer
+from run_bench import run_wiki_benchmark
+
+# нужно указать там url и key
+url = 'YOUR_URL'
+key = 'YOUR_KEY'
+model_name = 'YOUR_MODEL_NAME'
+
+logging.getLogger('sentence_transformers.SentenceTransformer').setLevel(logging.ERROR)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+encoder = SentenceTransformer('sergeyzh/BERTA').to(device)
+
+results = await run_wiki_benchmark(
+    model_name=model_name,
+    api=url,
+    key=key,
+    concurrency=40,
+    output_dir='wikibench_outputs',
+    number_of_articles=20,
+    encoder_name='sergeyzh/BERTA',
+    device='cuda',
+    prepare_env=False,
+    neighbor_count=0,
+    description_mode=True,
+    clusterization_with_hint=True,
+    shared_encoder=encoder,
+    shared_device=device
+)
+```

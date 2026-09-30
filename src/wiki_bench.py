@@ -1,0 +1,351 @@
+import logging
+from tqdm.asyncio import tqdm
+from wiki_gen import WikiGen
+from openai_utils import LlmCompleter, AsyncList
+from wiki_evaluater import WikiEvaluater
+from wiki_agent import WikiAgent
+from wiki_utils import WikiUtils
+from pathlib import Path
+import time
+import json
+
+
+try:
+    repo_root = Path(__file__).resolve().parents[1]   # .../WikiBench
+except:
+    repo_root = Path.cwd().resolve()
+
+class WikiBench:
+    '''Main class for runnig benchmark pipeline'''
+    def __init__(
+        self, 
+        url: str, 
+        key: str, 
+        model_name: str, 
+        model_safe_name: str,
+        device, 
+        encoder,
+        number_of_articles: int = 100,
+        concurrency: int = 40,
+        output_dir: str = 'results',
+        errors_file: str = 'errors.jsonl',
+        log_file: str = 'run.log',
+        needs_to_stop_on_error: bool = False,
+        is_think_mode_disabled: bool = True,
+        log_to_console: bool = True,
+        log_mode: str = 'w',
+        log_level=logging.INFO
+    ):
+
+        self.model_name = model_name
+        self.model_safe_name = model_safe_name
+        self.is_think_mode_disabled = is_think_mode_disabled
+
+        self.output_path = repo_root / output_dir / self.model_safe_name
+        self.output_path.mkdir(parents=True, exist_ok=True)
+        self.parent_output_path = self.output_path
+        self.output_path = self.output_path / 'benchmark_results.jsonl'
+        
+        self.logger = self.setup_logger(
+            level=log_level, 
+            log_file=log_file, 
+            log_to_console=log_to_console, 
+            log_mode=log_mode
+        )
+        
+        self.device = device
+        self.encoder = encoder
+        self.number_of_articles = number_of_articles
+        self.concurrency = concurrency
+        
+        self.article_list_path = repo_root / 'small_articles_data.txt'
+        with self.article_list_path.open('r', encoding='utf-8') as file:
+            self.article_names = [x for x in file.read().split('\n') if x.strip()][:self.number_of_articles]
+
+        self.client = LlmCompleter(api_address=url, api_key=key, model_name=model_name)
+        self.wiki_writer = WikiGen(client=self.client, concurrency=self.concurrency, is_think_mode_disabled=is_think_mode_disabled)
+        self.wiki_utility = WikiUtils(device=self.device, encoder=self.encoder, repo_root=repo_root)
+        self.wiki_agent = WikiAgent(utils=self.wiki_utility, client=self.wiki_writer)
+        self.is_env_prepared = False
+        self.wiki_evaluater = WikiEvaluater(self.wiki_agent.device, self.wiki_agent.encoder)
+        
+        self.query_logger = []
+        self.outline_logger = []
+        self.article_gen_logger = []
+        
+        self.errors_path = self.parent_output_path / errors_file
+        self.needs_to_stop_on_error = needs_to_stop_on_error
+        
+        self.logger.info(f'WikiBench initialized: model={self.model_name}, articles={len(self.article_names)}')
+
+    def setup_logger(self, level, log_file=None, log_to_console: bool = True, log_mode: str = 'w'):
+        logger = logging.getLogger(f'wikibench.{self.model_safe_name}')
+        logger.setLevel(level)
+
+        logger.handlers.clear()
+
+        fmt = logging.Formatter(
+            fmt='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+        )
+
+        if log_to_console:
+            sh = logging.StreamHandler()
+            sh.setFormatter(fmt)
+            logger.addHandler(sh)
+
+        if log_file:
+            log_path = self.parent_output_path / log_file
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(log_path, mode=log_mode, encoding='utf-8')
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+
+        logger.propagate = False
+        return logger
+
+    def format_bootstrap_results(self, result):
+        pr = (result[0], result[1], result[2])
+        rec = (result[3], result[4], result[5])
+        f = (result[6], result[7], result[8])
+
+        def format_one_result(metric, data):
+            mean, low, high = data
+            return f'{metric}={mean:.4f} [{low:.4f}; {high:.4f}]'
+
+        if len(result) > 9:
+            r = (result[9], result[10], result[11])
+            b = (result[12], result[13], result[14])
+            return ' | '.join([format_one_result('P', pr), format_one_result('R', rec), format_one_result('F', f), format_one_result('Rouge', r), format_one_result('BLEU', b)])
+
+        return ' | '.join([format_one_result('P', pr), format_one_result('R', rec), format_one_result('F', f)])
+
+    def prepare_env(self, window_size=600, overlap=0):
+        self.logger.info(f'Preparing env (snippets, bm25, embeddings): window={window_size}, overlap={overlap}')
+        if self.is_env_prepared:
+            self.logger.info('Env already prepared. Loading created corpus...')
+            self.wiki_utility.load_created_corpus()
+            self.wiki_agent.utils = self.wiki_utility
+            return
+
+        # self.logger.info('Downloading dataset...')
+
+        self.logger.info('Creating main corpus from scratch...')
+        self.wiki_agent.utils.create_corpus_from_scratch(article_names=self.article_names, window_size=window_size, overlap=overlap)
+        self.is_env_prepared = True
+        self.logger.info('Enviroment prepared!')
+
+    def load_enviroment(self):
+        self.logger.info('Loading enviroment...')
+        self.wiki_agent.utils.load_created_corpus()
+        self.logger.info('Enviroment loaded!')
+        
+    async def rank_query(self):  
+        self.logger.info('Stage: rank_query started')
+        
+        self.query_logger = []
+        processed_articles = []
+        for article_name in tqdm(self.article_names, desc='rank_query', unit='article'):
+            try:
+                start = time.perf_counter()
+                ranked_docs = await self.wiki_agent.create_ranking(article_name=article_name)
+                end = time.perf_counter()
+                runtime = end - start
+
+                start = time.perf_counter()
+                ndcg, pr_r_score = self.wiki_evaluater.rank_query(ranked_docs, article_name)
+                end = time.perf_counter()
+                evaluation_runtime = end - start
+                
+                record_ranking = self.create_record(
+                    evaluation_step='ranking',
+                    article_name=article_name,
+                    model_output=ranked_docs,
+                    runtime=runtime,
+                    evaluation_result={'ndcg': ndcg, 'r_pr': pr_r_score},
+                    evaluation_runtime=evaluation_runtime
+                )
+                self.append_to_json(record=record_ranking, output_path=self.output_path)
+
+                processed_articles.append(article_name)
+                self.query_logger.append((ndcg, pr_r_score))
+            except Exception as e:
+                self.logger.exception(f'rank_query failed for article={article_name}')
+                error_record = self.create_error_record(
+                    article_name=article_name,
+                    evaluation_step='ranking',
+                    error=str(e)
+                )
+                self.append_to_json(record=error_record, output_path=self.errors_path)
+                if self.needs_to_stop_on_error:
+                    break
+                
+                continue
+
+        result = self.wiki_evaluater.mean_value(self.query_logger)
+        self.logger.info(f'Final result for stage rank_query: {result}')
+        return result
+
+    async def rank_outline(self, neighbor_count: int = 0, description_mode: bool = True, clusterization_with_hint: bool = True):
+        self.logger.info(f'Stage: rank_outline started: neighbor_count={neighbor_count}, description_mode={description_mode}, clusterization_with_hint={clusterization_with_hint}')
+        
+        self.outline_logger = []
+        processed_articles = []
+        for article_name in tqdm(self.article_names, desc='rank_outline', unit='article'):
+            try:
+                start = time.perf_counter()
+                outline = await self.wiki_agent.create_outline(
+                    article_name=article_name, 
+                    clusterization_with_hint=clusterization_with_hint, 
+                    neighbor_count=neighbor_count, 
+                    description_mode=description_mode
+                )
+                end = time.perf_counter()
+                runtime = end - start
+
+                start = time.perf_counter()
+                p, r, f = self.wiki_evaluater.rank_outline(outline, article_name)
+                end = time.perf_counter()
+                evaluation_runtime = end - start
+                
+                record_outline = self.create_record(
+                    evaluation_step='outline',
+                    article_name=article_name,
+                    model_output=outline,
+                    runtime=runtime,
+                    evaluation_result={'precision': float(p), 'recall': float(r), 'f1': float(f)},
+                    evaluation_runtime=evaluation_runtime
+                )
+                self.append_to_json(record=record_outline, output_path=self.output_path)
+
+                processed_articles.append(article_name)
+                self.outline_logger.append((p, r, f))
+            except Exception as e:
+                self.logger.exception(f'rank_outline failed for article={article_name}')
+                error_record = self.create_error_record(
+                    article_name=article_name,
+                    evaluation_step='outline',
+                    error=str(e)
+                )
+                self.append_to_json(record=error_record, output_path=self.errors_path)
+                if self.needs_to_stop_on_error:
+                    break
+                
+                continue
+
+        if len(self.outline_logger) >= 2:
+            result = self.wiki_evaluater.bootstrap(self.outline_logger, is_flat=True)
+            self.logger.info(f'Final result for stage rank_outline: {self.format_bootstrap_results(result)}')
+            return result
+
+        return self.outline_logger
+
+    async def rank_sections(self):
+        self.logger.info('Stage: rank_sections started')
+        
+        self.article_gen_logger = []
+        processed_articles = []
+        for article_name in tqdm(self.article_names, desc='rank_sections', unit='article'):
+            try:
+                start = time.perf_counter()
+                sections = await self.wiki_agent.create_sections(article_name=article_name)
+                end = time.perf_counter()
+                runtime = end - start
+
+                start = time.perf_counter()
+                out = self.wiki_evaluater.rank_sections(sections, article_name)
+                end = time.perf_counter()
+                evaluation_runtime = end - start
+
+                record_sections = self.create_record(
+                    evaluation_step='sections',
+                    article_name=article_name,
+                    model_output=sections,
+                    runtime=runtime,
+                    evaluation_result={
+                        'p': list(map(float, out['precision'])), 
+                        'r': list(map(float, out['recall'])), 
+                        'f': list(map(float, out['f1'])), 
+                        'rl': list(map(float, out['rouge_l'])), 
+                        'bl': list(map(float, out['bleu']))
+                    },
+                    evaluation_runtime=evaluation_runtime,
+                    needs_serialization=True
+                )
+                self.append_to_json(record=record_sections, output_path=self.output_path)
+                
+                self.article_gen_logger.append((
+                    out['precision'], 
+                    out['recall'], 
+                    out['f1'], 
+                    out['rouge_l'], 
+                    out['bleu']
+                ))
+                processed_articles.append(article_name)
+            except Exception as e:
+                self.logger.exception(f'rank_sections failed for article={article_name}')
+                error_record = self.create_error_record(
+                    article_name=article_name,
+                    evaluation_step='sections',
+                    error=str(e)
+                )
+                self.append_to_json(record=error_record, output_path=self.errors_path)
+                if self.needs_to_stop_on_error:
+                    break
+                
+                continue
+
+        if len(self.article_gen_logger) >= 2: 
+            result = self.wiki_evaluater.bootstrap(self.article_gen_logger, is_flat=False)
+            self.logger.info(f'Final result for stage rank_sections: {self.format_bootstrap_results(result)}')
+            return result
+        else:
+            self.logger.info(f'Final result for stage rank_sections: {self.article_gen_logger}')
+            
+        return self.article_gen_logger
+        
+    def create_record(
+        self,
+        evaluation_step: str,
+        article_name: str,
+        model_output,
+        runtime,
+        evaluation_result,
+        evaluation_runtime,
+        needs_serialization: bool = False
+    ):
+        if needs_serialization:
+            model_output = [[[k, n], v] for (k, n), v in model_output.items()]
+            
+        record = {
+            'model_name': self.model_name,
+            'article_name': article_name,
+            'evaluation_step': evaluation_step,
+            'model_output': model_output,
+            'runtime': round(runtime, 4),
+            'evaluation_result': evaluation_result,
+            'evaluation_runtime': round(evaluation_runtime, 4)
+        }
+
+        return record
+
+    def create_error_record(
+        self,
+        evaluation_step,
+        article_name,
+        error
+    ):
+        error_record = {
+            'model_name': self.model_name,
+            'article_name': article_name,
+            'evaluation_step': evaluation_step,
+            'error': str(error)
+        }
+
+        return error_record
+
+    def append_to_json(self, record: dict, output_path):
+        line = json.dumps(record, ensure_ascii=False) + '\n'
+        with output_path.open('a', encoding='utf-8') as f:
+            f.write(line)
+            f.flush()
